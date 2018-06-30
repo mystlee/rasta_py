@@ -147,7 +147,7 @@ def lpc2cep(a, nout = 0):
     
     return cep
 
-def lifter(x, lift = 0.6, invs = 1):
+def lifter(x, lift = 0.6, invs = False):
     ncep = x.shape[0]
     
     if lift == 0:
@@ -160,7 +160,7 @@ def lifter(x, lift = 0.6, invs = 1):
         liftwts = np.append(1, liftwts)
         
         if (invs):
-            liftwts = np.divide(liftwts, 1)
+            liftwts = np.divide(1, liftwts)
         
         y = np.matmul(np.diag(liftwts), x)
     
@@ -349,7 +349,7 @@ def spec2cep(spec, ncep, dcttype):
         dctm[:, 0] = np.divide(dctm[:, 0], 2)
         dctm[:, int(nrow - 1)] = np.divide(dctm[:, int(nrow - 1)], 2)
     
-    cep = np.matmul(dctm, np.log(spec))
+    cep = np.matmul(dctm, np.log(np.add(spec, 1e-8)))
     
     return cep, dctm
 
@@ -406,6 +406,151 @@ def deltas(x, w = 9):
     d = signal.lfilter(win, 1, xx, axis = 1)
     d = d[:, int(2 * hlen) : int(2 * hlen + cols)]
     return d
+
+def cep2spec(cep, nfreq, dcttype = 2):
+    ncep, ncol = cep.shape
     
+    dctm  = np.zeros((ncep, nfreq))
+    idctm = np.zeros((nfreq, ncep))
+    
+    if dcttype == 2 or dcttype == 3:
+        for i in range(ncep):
+            dctm[i, :] = np.multiply(np.cos(np.multiply(np.divide(np.multiply(i, np.arange(1, 2 * nfreq, 2)),
+                                                                  (2 * nfreq)), np.pi)), np.sqrt(2 / nfreq))        
+            
+        if dcttype == 2:
+            dctm[0, :] = np.divide(dctm[0, :], np.sqrt(2))
+        else:
+            dctm[0, :] = np.divide(dctm[0, :], 2)
+                
+        idctm = dctm.T
+        
+    elif dcttype == 4:
+        for i in range(ncep):
+            idctm[:, i] = np.multiply(np.cos(np.multiply(np.divide(np.multiply(i, np.arange(1, nfreq + 1).T), (nfreq + 1)), np.pi)), 2)
+            
+        idctm[:, 0:ncep] = np.divide(idctm[:, 0:ncep], 2)    
+    
+    else:
+        for i in range(ncep):
+            idctm[:, i] = np.multiply(np.cos(np.multiply(np.divide(np.multiply(i, np.arange(0, nfreq).T), (nfreq - 1)), np.pi)), 2)
+            
+        idctm[:, [0, -1]] = np.divide(idctm[:, [0, -1]], 2)
+        
+    spec = np.exp(np.matmul(idctm, cep))
+    
+    return spec, idctm
+
+def invpostaud(y, fmax, fbtype = 'bark', broaden = 0):
+    
+    nbands, nframes = y.shape
+    
+    if fbtype == 'bark':
+        bandcfhz = bark2hz(np.linspace(0, hz2bark(fmax), nbands))
+    elif fbtype == 'mel':
+        bandcfhz = mel2hz(np.linspace(0, hz2mel(fmax), nbands))
+    elif fbtype == 'htkmel' or fbtype == 'fcmel':
+        bandcfhz = mel2hz(np.linspace(0, hz2mel(fmax, htk = True), nbands), htk = True)
+        
+    bandcfhz = bandcfhz[broaden : (nbands - broaden)]
+    
+    fsq = np.power(bandcfhz, 2)
+    ftmp = np.add(fsq, 1.6e5)
+    eql = np.multiply(np.power(np.divide(fsq, ftmp), 2), 
+                      np.divide(np.add(fsq, 1.44e6), np.add(fsq, 9.61e6)))
+    
+    x = np.power(y, np.divide(1, 0.33))
+    
+    if eql[0] == 0:
+        eql[0] = eql[1]
+        eql[-1] = eql[-2]
+        
+    x = np.divide(x[broaden : (nbands - broaden + 1), :], np.add(np.tile(eql.T, (nframes, 1)).T, 1e-8))
+    
+    return x, eql
+
+def invpowspec(y, fs, win_time, hop_time, excit = []):
+    nrow, ncol = y.shape
+    r = excit
+    
+    winpts = int(np.round(np.multiply(win_time, fs)))
+    steppts = int(np.round(np.multiply(hop_time, fs)))
+    nfft = int(np.power(2, np.ceil(np.divide(np.log(winpts), np.log(2)))))
+    
+    # Can't predict librosa stft length...
+    tmp = librosa.istft(y, hop_length = steppts, win_length = winpts, 
+                      window='hann', center = False)
+    xlen = len(tmp)
+    # xlen = int(np.add(winpts, np.multiply(steppts, np.subtract(ncol, 1))))
+    # xlen = int(np.multiply(steppts, np.subtract(ncol, 1)))
+    
+    if len(r) == 0:
+        r = np.squeeze(np.random.randn(xlen, 1))
+    r = r[0:xlen]
+    
+    R = librosa.stft(np.divide(r, 32768 * 12), n_fft = nfft, hop_length = steppts,
+                     win_length = winpts, window = 'hann', center = False)
+
+    R = np.multiply(R, np.sqrt(y))
+    x = librosa.istft(R, hop_length = steppts, win_length = winpts, 
+                      window = 'hann', center = False)
+                     
+    return x
+
+def invaudspec(aspectrum, fs = 16000, nfft = 512, fbtype = 'bark', 
+               min_freq = 0, max_freq = 0, sumpower = True, band_width = 1):
+    
+    if max_freq == 0:
+        max_freq = fs / 2
+    nfilts, nframes = aspectrum.shape
+    
+    if fbtype == 'bark':
+        wts = fft2barkmx(nfft, fs, nfilts, band_width, min_freq, max_freq)
+    elif fbtype == 'mel':
+        wts = fft2melmx(nfft, fs, nfilts, band_width, min_freq, max_freq)
+    elif fbtype == 'htkmel':
+        wts = fft2melmx(nfft, fs, nfilts, band_width, min_freq, max_freq, htk = True, constamp = True)
+    elif fbtype == 'fcmel':
+        wts = fft2melmx(nfft, fs, nfilts, band_width, min_freq, max_freq, htk = True, constamp = False)
+    
+    wts = wts[:, 0:int(nfft / 2 + 1)]
+    
+    ww = np.matmul(wts.T, wts)
+    itws = np.divide(wts.T, np.tile(np.maximum(np.divide(np.mean(np.diag(ww)), 100), 
+                                               np.sum(ww, axis = 0)), (nfilts, 1)).T)
+    if sumpower == True:
+        spec = np.matmul(itws, aspectrum)
+    else:
+        spec = np.power(np.matmul(itws, np.sqrt(aspectrum)))
+   
+    return spec, wts, itws
+
+def invmelfcc(cep, fs, win_time = 0.040, hop_time = 0.020, lifterexp = 0.6, sumpower = True,
+             preemph = 0.97, max_freq = 6500, min_freq = 50, n_bands = 40, band_width = 1,
+             dcttype = 2, fbtype = 'mel', usecmp = False, modelorder = 0, broaden = 0, excitation = []):
+    
+    winpts = int(np.round(np.multiply(win_time, fs)))
+    nfft = int(np.power(2, np.ceil(np.divide(np.log(winpts), np.log(2)))))
+    
+    cep = lifter(cep, lift = lifterexp, invs = True)
+    
+    pspc, _ = cep2spec(cep, nfreq = int(n_bands + 2 * broaden), dcttype = dcttype)
+    
+    if usecmp == True:
+        aspc, _ = invpostaud(pspc, fmax = max_freq, fbtype = fbtype, broaden = broaden)
+    else:
+        aspc = pspc
+        
+    spec, _, _ = invaudspec(aspc, fs = fs, nfft = nfft, fbtype = fbtype, min_freq = min_freq,
+                            max_freq = max_freq, sumpower = sumpower, band_width = band_width)
+    
+    x = invpowspec(spec, fs, win_time = win_time, hop_time = hop_time, excit = excitation)
+    
+    if preemph != 0:
+        b = [1, -preemph]
+        a = 1
+        x = signal.lfilter(b, a, x)
+    
+    return x, aspc, spec, pspc    
 # reference
 # https://labrosa.ee.columbia.edu/matlab/rastamat/
